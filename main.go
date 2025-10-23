@@ -562,6 +562,415 @@ func (g *Game) findAdjacentTile(x, y int) (int, int, error) {
 	return 0, 0, fmt.Errorf("no valid adjacent tile found")
 }
 
+// ========== Enhanced AI Logic ==========
+func (g *Game) aiTurn(player *Player) error {
+	fmt.Printf("%s (AI) is thinking...\n", player.Name)
+	
+	// AI moves units
+	for _, unit := range player.Units {
+		if unit.Movement > 0 {
+			// Simple AI: move randomly
+			directions := [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+			dir := directions[rand.Intn(len(directions))]
+			newX, newY := (unit.X+dir[0]+MAP_WIDTH)%MAP_WIDTH, (unit.Y+dir[1]+MAP_HEIGHT)%MAP_HEIGHT
+			
+			if g.isValidTile(newX, newY) {
+				if err := g.moveUnit(unit, newX, newY); err == nil {
+					fmt.Printf("%s moved %s to (%d,%d)\n", player.Name, UnitToString(unit.Type), newX, newY)
+				}
+			}
+		}
+	}
+	
+	// AI manages cities
+	for _, city := range player.Cities {
+		if len(city.ProductionQueue) == 0 {
+			// Randomly choose to produce a unit or building
+			if rand.Intn(2) == 0 {
+				unitType := UnitType(rand.Intn(int(UNIT_COUNT)))
+				if unitType.IsValid() {
+					g.addToProductionQueue(city, PRODUCTION_UNIT, int(unitType))
+				}
+			} else {
+				buildingType := BuildingType(rand.Intn(int(BUILDING_COUNT)))
+				if buildingType.IsValid() {
+					g.addToProductionQueue(city, PRODUCTION_BUILDING, int(buildingType))
+				}
+			}
+		}
+	}
+	
+	// AI research
+	if rand.Intn(100) < 50 {
+		player.Researching = g.chooseNextTech(player)
+		fmt.Printf("%s started researching %s\n", player.Name, TechToString(player.Researching))
+	}
+	
+	return nil
+}
+
+// ========== Enhanced Map Display ==========
+func (g *Game) displayMap(player *Player) {
+	fmt.Println("\nWorld Map:")
+	for y := 0; y < MAP_HEIGHT; y++ {
+		for x := 0; x < MAP_WIDTH; x++ {
+			tile := g.Map[y][x]
+			symbol := "."
+			
+			switch {
+			case tile.CityID != -1:
+				// Find city owner
+				for _, p := range g.Players {
+					if city, exists := p.Cities[tile.CityID]; exists {
+						if p.ID == player.ID {
+							symbol = "C"
+						} else {
+							symbol = string(p.Name[0])
+						}
+						break
+					}
+				}
+			case tile.UnitID != -1:
+				// Find unit owner
+				for _, p := range g.Players {
+					if unit, exists := p.Units[tile.UnitID]; exists {
+						if p.ID == player.ID {
+							symbol = "U"
+						} else {
+							symbol = string(p.Name[0])
+						}
+						break
+					}
+				}
+			default:
+				// Terrain symbols
+				switch tile.Terrain {
+				case TERRAIN_OCEAN:
+					symbol = "~"
+				case TERRAIN_MOUNTAINS:
+					symbol = "^"
+				case TERRAIN_FOREST:
+					symbol = "*"
+				case TERRAIN_HILLS:
+					symbol = "▲"
+				case TERRAIN_DESERT:
+					symbol = "d"
+				case TERRAIN_TUNDRA:
+					symbol = "t"
+				case TERRAIN_JUNGLE:
+					symbol = "j"
+				}
+			}
+			
+			fmt.Printf("%s ", symbol)
+		}
+		fmt.Println()
+	}
+	
+	fmt.Println("\nLegend:")
+	fmt.Println("C - Your City")
+	fmt.Println("U - Your Unit")
+	fmt.Println("Letter - Other Civilization")
+	fmt.Println(". - Plains, ~ - Ocean, ^ - Mountains")
+	fmt.Println("* - Forest, ▲ - Hills, d - Desert")
+	fmt.Println("t - Tundra, j - Jungle")
+}
+
+// ========== Enhanced Unit Movement ==========
+func (g *Game) moveUnits(player *Player, validator *InputValidator) error {
+	if len(player.Units) == 0 {
+		return fmt.Errorf("no units to move")
+	}
+	
+	unitList := make([]string, 0, len(player.Units))
+	unitIDs := make([]int, 0, len(player.Units))
+	for id, unit := range player.Units {
+		unitList = append(unitList, fmt.Sprintf("%s at (%d,%d)", UnitToString(unit.Type), unit.X, unit.Y))
+		unitIDs = append(unitIDs, id)
+	}
+	
+	choice, err := validator.GetChoiceInput("\n🚶 Select Unit to Move:", unitList)
+	if err != nil {
+		return err
+	}
+	
+	unitID := unitIDs[choice-1]
+	unit, exists := player.Units[unitID]
+	if !exists {
+		return ErrUnitNotFound
+	}
+	
+	fmt.Printf("Moving %s from (%d,%d)\n", UnitToString(unit.Type), unit.X, unit.Y)
+	
+	newX, err := validator.GetIntInput("Enter new X coordinate: ", 0, MAP_WIDTH-1)
+	if err != nil {
+		return err
+	}
+	
+	newY, err := validator.GetIntInput("Enter new Y coordinate: ", 0, MAP_HEIGHT-1)
+	if err != nil {
+		return err
+	}
+	
+	return g.moveUnit(unit, newX, newY)
+}
+
+func (g *Game) moveUnit(unit *Unit, newX, newY int) error {
+	if !g.isValidTile(newX, newY) {
+		return ErrInvalidMove
+	}
+	
+	// Check if tile is occupied by another unit
+	if g.Map[newY][newX].UnitID != -1 {
+		return fmt.Errorf("tile occupied by another unit")
+	}
+	
+	// Clear old position
+	g.Map[unit.Y][unit.X].UnitID = -1
+	
+	// Set new position
+	unit.X = newX
+	unit.Y = newY
+	g.Map[newY][newX].UnitID = unit.ID
+	
+	// Claim territory for player
+	g.Map[newY][newX].OwnerID = unit.OwnerID
+	
+	unit.Movement = 0
+	return nil
+}
+
+// ========== Enhanced City Founding ==========
+func (g *Game) foundCity(player *Player, validator *InputValidator) error {
+	// Find settler unit
+	var settler *Unit
+	for _, unit := range player.Units {
+		if unit.Type == UNIT_SETTLER {
+			settler = unit
+			break
+		}
+	}
+	
+	if settler == nil {
+		return fmt.Errorf("no settler unit available")
+	}
+	
+	fmt.Printf("Founding city at (%d,%d)\n", settler.X, settler.Y)
+	
+	cityName, err := validator.GetStringInput("Enter city name: ", 3, 20)
+	if err != nil {
+		return err
+	}
+	
+	// Create new city
+	city := &City{
+		ID:         g.NextCityID,
+		Name:       cityName,
+		Population: BASE_CITY_POPULATION,
+		OwnerID:    player.ID,
+		X:          settler.X,
+		Y:          settler.Y,
+	}
+	g.NextCityID++
+	
+	// Update map
+	g.Map[settler.Y][settler.X].CityID = city.ID
+	g.Map[settler.Y][settler.X].UnitID = -1 // Remove settler
+	
+	// Add to player
+	player.Cities[city.ID] = city
+	
+	// Remove settler unit
+	delete(player.Units, settler.ID)
+	
+	fmt.Printf("🏙️ Founded new city: %s!\n", cityName)
+	return nil
+}
+
+// ========== Enhanced Research System ==========
+func (g *Game) researchTech(player *Player, validator *InputValidator) error {
+	availableTechs := make([]string, 0)
+	techIDs := make([]TechType, 0)
+	
+	for tech := TECH_AGRICULTURE; tech < TECH_COUNT; tech++ {
+		if !player.Techs[tech] {
+			availableTechs = append(availableTechs, TechToString(tech))
+			techIDs = append(techIDs, tech)
+		}
+	}
+	
+	if len(availableTechs) == 0 {
+		return fmt.Errorf("no technologies left to research")
+	}
+	
+	choice, err := validator.GetChoiceInput("\n🔬 Select Technology to Research:", availableTechs)
+	if err != nil {
+		return err
+	}
+	
+	player.Researching = techIDs[choice-1]
+	fmt.Printf("Researching %s...\n", TechToString(player.Researching))
+	return nil
+}
+
+// ========== Enhanced Status Display ==========
+func (g *Game) displayStatus(player *Player) {
+	fmt.Printf("\n🏛️ %s Status (%d BC)\n", player.Name, g.Year)
+	fmt.Printf("🏆 Score: %d\n", player.Score)
+	fmt.Printf("💰 Gold: %d\n", player.Gold)
+	fmt.Printf("😊 Happiness: %d\n", player.Happiness)
+	fmt.Printf("🔬 Researching: %s\n", TechToString(player.Researching))
+	
+	fmt.Println("\nCities:")
+	for _, city := range player.Cities {
+		fmt.Printf("- %s (Pop: %d)\n", city.Name, city.Population)
+	}
+	
+	fmt.Println("\nUnits:")
+	for _, unit := range player.Units {
+		fmt.Printf("- %s at (%d,%d)\n", UnitToString(unit.Type), unit.X, unit.Y)
+	}
+}
+
+// ========== Enhanced City Information ==========
+func (g *Game) displayCityInfo(city *City) {
+	fmt.Printf("\n🏙️ %s\n", city.Name)
+	fmt.Printf("Population: %d\n", city.Population)
+	fmt.Printf("Food: %d\n", city.Food)
+	fmt.Printf("Production: %d\n", city.Production)
+	
+	fmt.Println("\nBuildings:")
+	if len(city.Buildings) == 0 {
+		fmt.Println("None")
+	} else {
+		for _, building := range city.Buildings {
+			fmt.Printf("- %s\n", BuildingToString(building))
+		}
+	}
+	
+	g.displayProductionQueue(city)
+}
+
+// ========== Enhanced Production System ==========
+func (g *Game) produceUnit(city *City, validator *InputValidator) error {
+	options := make([]string, 0, UNIT_COUNT)
+	for unit := UNIT_SETTLER; unit < UNIT_COUNT; unit++ {
+		options = append(options, UnitToString(unit))
+	}
+	
+	choice, err := validator.GetChoiceInput("\n⚔️ Select Unit to Produce:", options)
+	if err != nil {
+		return err
+	}
+	
+	unitType := UnitType(choice - 1)
+	if !unitType.IsValid() {
+		return ErrInvalidUnit
+	}
+	
+	return g.addToProductionQueue(city, PRODUCTION_UNIT, int(unitType))
+}
+
+func (g *Game) buildBuilding(city *City, validator *InputValidator) error {
+	options := make([]string, 0, BUILDING_COUNT)
+	for building := BUILDING_MONUMENT; building < BUILDING_COUNT; building++ {
+		options = append(options, BuildingToString(building))
+	}
+	
+	choice, err := validator.GetChoiceInput("\n🏗️ Select Building to Construct:", options)
+	if err != nil {
+		return err
+	}
+	
+	buildingType := BuildingType(choice - 1)
+	if !buildingType.IsValid() {
+		return ErrInvalidUnit
+	}
+	
+	return g.addToProductionQueue(city, PRODUCTION_BUILDING, int(buildingType))
+}
+
+func (g *Game) addToProductionQueue(city *City, itemType ProductionItemType, itemID int) error {
+	if len(city.ProductionQueue) >= 5 {
+		return ErrProductionQueueFull
+	}
+	
+	// Determine cost based on item type
+	cost := 0
+	switch itemType {
+	case PRODUCTION_UNIT:
+		unitType := UnitType(itemID)
+		switch unitType {
+		case UNIT_SETTLER:
+			cost = 100
+		case UNIT_WARRIOR:
+			cost = 50
+		case UNIT_ARCHER:
+			cost = 60
+		case UNIT_SWORDSMAN:
+			cost = 80
+		case UNIT_KNIGHT:
+			cost = 120
+		case UNIT_MUSKETEER:
+			cost = 150
+		case UNIT_CANNON:
+			cost = 200
+		case UNIT_TANK:
+			cost = 300
+		}
+	case PRODUCTION_BUILDING:
+		buildingType := BuildingType(itemID)
+		switch buildingType {
+		case BUILDING_MONUMENT:
+			cost = 80
+		case BUILDING_GRANARY:
+			cost = 100
+		case BUILDING_LIBRARY:
+			cost = 120
+		case BUILDING_TEMPLE:
+			cost = 150
+		case BUILDING_BARRACKS:
+			cost = 100
+		case BUILDING_WALLS:
+			cost = 200
+		case BUILDING_UNIVERSITY:
+			cost = 250
+		case BUILDING_FACTORY:
+			cost = 300
+		}
+	}
+	
+	city.ProductionQueue = append(city.ProductionQueue, ProductionItem{
+		Type:      itemType,
+		ItemID:    itemID,
+		Progress:  0,
+		TotalCost: cost,
+	})
+	
+	fmt.Printf("Added to production queue\n")
+	return nil
+}
+
+func (g *Game) displayProductionQueue(city *City) {
+	fmt.Println("\nProduction Queue:")
+	if len(city.ProductionQueue) == 0 {
+		fmt.Println("Empty")
+		return
+	}
+	
+	for i, item := range city.ProductionQueue {
+		name := ""
+		switch item.Type {
+		case PRODUCTION_UNIT:
+			name = UnitToString(UnitType(item.ItemID))
+		case PRODUCTION_BUILDING:
+			name = BuildingToString(BuildingType(item.ItemID))
+		}
+		
+		fmt.Printf("%d. %s: %d/%d\n", i+1, name, item.Progress, item.TotalCost)
+	}
+}
+
 // ========== Enhanced Main Game Loop with Error Handling ==========
 func (g *Game) Run() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -922,7 +1331,7 @@ func (g *Game) cityManagementMenu(city *City, player *Player, validator *InputVa
 	}
 }
 
-// ========== Enhanced Main Function with Error Handling ==========
+// ========== Main Function ==========
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	validator := NewInputValidator(scanner)
@@ -944,5 +1353,3 @@ func main() {
 	
 	game.Run()
 }
-
-
